@@ -60,7 +60,7 @@ cmake -S "$DIR" -B "$DIR/build" -DCMAKE_BUILD_TYPE=Release -DCMAKE_POLICY_VERSIO
 cmake --build "$DIR/build" --target owl -j"$(nproc)" >/dev/null
 
 BIN=$DIR/build/daemon/owl
-case "$("$BIN" -S intersect -R 12 -m 02:00:00:00:00:01 -F -E -A -h 2>&1 || true)" in
-  *"invalid option"*|*"-R takes"*|*"-m takes"*) echo "$BIN lacks -S, -R, -m, -F, -E or -A; did the patches apply?"; exit 1 ;;
+case "$("$BIN" -S intersect -R 12 -m 02:00:00:00:00:01 -F -E -A -M 550 -h 2>&1 || true)" in
+  *"invalid option"*|*"-R takes"*|*"-m takes"*) echo "$BIN lacks -S, -R, -m, -F, -E, -A or -M; did the patches apply?"; exit 1 ;;
 esac
 echo "built $BIN: owl@${OWL_COMMIT:0:7} + $(ls "$ROOT"/patches/owl-*.patch | wc -l) patches"

@@ -1,0 +1,143 @@
+diff --git a/daemon/owl.c b/daemon/owl.c
+index ccab874..679152c 100644
+--- a/daemon/owl.c
++++ b/daemon/owl.c
+@@ -95,6 +95,7 @@ int main(int argc, char *argv[]) {
+ 	int metric_first = 0;
+ 	int no_monitor_mode = 0;
+ 	int accept_addba = 0;
++	uint32_t metric = 0;
+ 	enum awdl_chanseq_strategy strategy = AWDL_CHANSEQ_VERBATIM;
+ 	int widen_max = 4;
+ 	struct ether_addr addr_override;
+@@ -107,7 +108,7 @@ int main(int argc, char *argv[]) {
+ 
+ 	struct daemon_state state;
+ 
+-	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FEA")) != -1) {
++	while ((c = getopt(argc, argv, "Dc:dvi:h:a:t:fNS:W:R:m:FEAM:")) != -1) {
+ 		switch (c) {
+ 			case 'm': {
+ 				/* Our AWDL address, instead of the monitor interface's MAC. On
+@@ -203,6 +204,9 @@ int main(int argc, char *argv[]) {
+ 				 * aggregate (src/rx.c, awdl_send_addba_response). */
+ 				accept_addba = 1;
+ 				break;
++			case 'M':
++				metric = (uint32_t) strtoul(optarg, NULL, 10);
++				break;
+ 			case '?':
+ 				if (optopt == 'i')
+ 					fprintf(stderr, "Option -%c needs to specify a wireless interface.\n", optopt);
+@@ -286,12 +290,21 @@ int main(int argc, char *argv[]) {
+ 	state.awdl_state.channel.strategy = strategy;
+ 	state.awdl_state.channel.widen_max = widen_max;
+ 	state.awdl_state.channel.fixed_radio = fixed_radio;
++	if (metric) {
++		state.awdl_state.election.self_metric = metric;
++		state.awdl_state.election.master_metric = metric;
++		state.awdl_state.election.custom_metric = 1;
++	}
+ 	state.awdl_state.election.metric_first = metric_first;
+ 	state.awdl_state.accept_addba = accept_addba;
+ 	if (accept_addba)
+ 		log_info("Block Ack: accepting session requests (A-MPDU)");
+-	if (metric_first)
+-		log_info("election: by metric, then counter");
++	if (metric_first) {
++		if (state.awdl_state.election.custom_metric)
++			log_info("election: by metric (%u), then counter", state.awdl_state.election.self_metric);
++		else
++			log_info("election: by metric, then counter");
++	}
+ 	if (fixed_radio)
+ 		log_info("fixed radio: multicast in any slot, unicast whenever the peer is on our channel");
+ 	log_info("channel sequence strategy: %s",
+diff --git a/src/election.c b/src/election.c
+index 002de64..0d9ea2a 100644
+--- a/src/election.c
++++ b/src/election.c
+@@ -54,6 +54,7 @@ void awdl_election_state_init(struct awdl_election_state *state, const struct et
+ 	state->sync_addr = *self;
+ 	state->self_addr = *self;
+ 	state->metric_first = 0;
++	state->custom_metric = 0;
+ 	awdl_election_reset_metric(state);
+ 	awdl_election_reset_self(state);
+ }
+diff --git a/src/election.h b/src/election.h
+index 8cb9eef..0b8508e 100644
+--- a/src/election.h
++++ b/src/election.h
+@@ -40,6 +40,8 @@ struct awdl_election_state {
+ 	/* owl -E, in our own state only: rank masters by metric before counter.
+ 	 * See awdl_election_compare_master(). */
+ 	uint8_t metric_first;
++	/* owl -M: custom election metric configured */
++	uint8_t custom_metric;
+ };
+ 
+ int awdl_election_is_sync_master(const struct awdl_election_state *state, const struct ether_addr *addr);
+diff --git a/src/rx.c b/src/rx.c
+index a4b8694..a586300 100644
+--- a/src/rx.c
++++ b/src/rx.c
+@@ -185,8 +185,11 @@ int awdl_handle_data_path_state_tlv(struct awdl_peer *src, const struct buf *val
+ 		offset += 3;
+ 	}
+ 	if (flags & AWDL_DATA_PATH_FLAG_SOCIAL_CHANNEL_MAP) {
+-		READ_LE16(val, offset, NULL /* supported social channels */);
++		uint16_t social = 0;
++		READ_LE16(val, offset, &social);
+ 		offset += 2;
++		log_debug("rx data path: peer=%s flags=0x%04x social=0x%04x",
++		          ether_ntoa(&src->addr), flags, social);
+ 	}
+ 	if (flags & AWDL_DATA_PATH_FLAG_INFRA_INFO) {
+ 		READ_ETHER_ADDR(val, offset, NULL /* BSSID */);
+diff --git a/src/tx.c b/src/tx.c
+index ac38c2e..97c006c 100644
+--- a/src/tx.c
++++ b/src/tx.c
+@@ -121,15 +121,21 @@ int awdl_init_sync_params_tlv(uint8_t *buf, const struct awdl_state *state) {
+ 	tlv->reserved = 0;
+ 
+ 	/* TODO: dynamic info needs to be adjusted during runtime */
+-	tlv->next_aw_channel = awdl_chan_num(state->channel.current,
+-	                                     state->channel.enc); /* TODO need to calculate this from current seq */
++	if (state->election.custom_metric)
++		tlv->next_aw_channel = awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS);
++	else
++		tlv->next_aw_channel = awdl_chan_num(state->channel.current,
++		                                     state->channel.enc); /* TODO need to calculate this from current seq */
+ 	tlv->next_aw_seq = htole16(awdl_sync_current_aw(now, &state->sync));
+ 	tlv->ap_alignment = tlv->next_aw_seq; /* awdl_fill_sync_params(..) */
+ 	tlv->tx_down_counter = htole16(awdl_sync_next_aw_tu(now, &state->sync));
+ 	tlv->af_period = htole16(state->psf_interval);
+ 	tlv->presence_mode = state->sync.presence_mode; /* always available, usually 4 */
+ 	tlv->master_addr = state->election.master_addr;
+-	tlv->master_channel = awdl_chan_num(state->channel.master, state->channel.enc);
++	if (state->election.custom_metric)
++		tlv->master_channel = awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS);
++	else
++		tlv->master_channel = awdl_chan_num(state->channel.master, state->channel.enc);
+ 	/* lower bound is 0 */
+ 	if (le16toh(tlv->aw_com_length) < (le16toh(tlv->aw_period) * tlv->presence_mode - le16toh(tlv->tx_down_counter)))
+ 		tlv->remaining_aw_length = htole16(0);
+@@ -201,8 +207,14 @@ int awdl_init_election_params_v2_tlv(uint8_t *buf, const struct awdl_state *stat
+ 	tlv->unknown = htole32(0);
+ 	tlv->reserved = htole32(0);
+ 
+-	tlv->master_counter = htole32(state->election.master_counter);
+-	tlv->self_counter = htole32(state->election.self_counter);
++	if (state->election.custom_metric && awdl_election_is_sync_master(&state->election, &state->self_address)) {
++		uint32_t counter = (uint32_t) (clock_time_us() / 3140000);
++		tlv->master_counter = htole32(counter);
++		tlv->self_counter = htole32(counter);
++	} else {
++		tlv->master_counter = htole32(state->election.master_counter);
++		tlv->self_counter = htole32(state->election.self_counter);
++	}
+ 
+ 	return sizeof(struct awdl_election_params_v2_tlv);
+ }
