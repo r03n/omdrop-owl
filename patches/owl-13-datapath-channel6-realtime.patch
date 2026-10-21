@@ -1,0 +1,157 @@
+diff --git a/src/frame.h b/src/frame.h
+index e4fc8cc..c128fd1 100644
+--- a/src/frame.h
++++ b/src/frame.h
+@@ -185,13 +185,34 @@ struct awdl_ht_capabilities_tlv {
+ } __attribute__((__packed__));
+ 
+ enum awdl_data_path_state_flags {
+-	AWDL_DATA_PATH_FLAG_COUNTRY_CODE = 0x0100,
+-	AWDL_DATA_PATH_FLAG_SOCIAL_CHANNEL_MAP = 0x0200,
+ 	AWDL_DATA_PATH_FLAG_INFRA_INFO = 0x0001,
+ 	AWDL_DATA_PATH_FLAG_INFRA_ADDRESS = 0x0002,
+ 	AWDL_DATA_PATH_FLAG_AWDL_ADDRESS = 0x0004,
++	AWDL_DATA_PATH_FLAG_RSDB = 0x0008,
+ 	AWDL_DATA_PATH_FLAG_UMI = 0x0010,
+-	/* TODO complete */
++	AWDL_DATA_PATH_FLAG_DUALBAND = 0x0020,
++	AWDL_DATA_PATH_FLAG_AIRPLAY_SINK = 0x0040,
++	AWDL_DATA_PATH_FLAG_FOLLOW_CHAN_SEQ = 0x0080,
++	AWDL_DATA_PATH_FLAG_COUNTRY_CODE = 0x0100,
++	AWDL_DATA_PATH_FLAG_SOCIAL_CHANNEL_MAP = 0x0200,
++	AWDL_DATA_PATH_FLAG_AIRPLAY_SOLO = 0x0400,
++	AWDL_DATA_PATH_FLAG_UMI_SUPPORTED = 0x0800,
++	AWDL_DATA_PATH_FLAG_UNICAST_OPTIONS = 0x1000,
++	AWDL_DATA_PATH_FLAG_REALTIME = 0x2000,
++	AWDL_DATA_PATH_FLAG_RANGEABLE = 0x4000,
++	AWDL_DATA_PATH_FLAG_EXT_FLAGS = 0x8000,
++};
++
++enum awdl_data_path_state_ext_flags {
++	AWDL_DATA_PATH_EXT_LOGTRIGGER = 0x0001,
++	AWDL_DATA_PATH_EXT_RANGING_DISC = 0x0002,
++	AWDL_DATA_PATH_EXT_RLFC = 0x0004,
++	AWDL_DATA_PATH_EXT_SOCIAL_MAP_SUPPORTED = 0x0008,
++	AWDL_DATA_PATH_EXT_DYNAMIC_SDB = 0x0010,
++	AWDL_DATA_PATH_EXT_DFS_PROXY = 0x0040,
++	AWDL_DATA_PATH_EXT_HIGH_EFFICIENCY = 0x0100,
++	AWDL_DATA_PATH_EXT_FAST_DISCOVERY = 0x0400,
++	AWDL_DATA_PATH_EXT_WIFI_6E = 0x0800,
+ };
+ 
+ struct awdl_data_path_state_tlv {
+diff --git a/src/tx.c b/src/tx.c
+index 97c006c..18ca339 100644
+--- a/src/tx.c
++++ b/src/tx.c
+@@ -29,6 +29,7 @@
+ #include "ieee80211.h"
+ 
+ #include "crc32.h"
++#include "log.h"
+ 
+ #define AWDL_DNS_SHORT_LOCAL  0xc00c  /* .local */
+ 
+@@ -237,47 +238,85 @@ int awdl_init_service_params_tlv(uint8_t *buf, const struct awdl_state *state __
+ 	return sizeof(struct awdl_service_params_tlv);
+ }
+ 
+-int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *state __attribute__((unused))) {
++int awdl_init_ht_capabilities_tlv(uint8_t *buf, const struct awdl_state *state) {
+ 	struct awdl_ht_capabilities_tlv *tlv = (struct awdl_ht_capabilities_tlv *) buf;
+ 
+ 	tlv->type = AWDL_ENHANCED_DATA_RATE_CAPABILITIES_TLV;
+ 	tlv->length = htole16(sizeof(struct awdl_ht_capabilities_tlv) - sizeof(struct tl));
+ 
+ 	/* TODO extract capabilities from nl80211 (nl80211_band_attr) */
+-	tlv->ht_capabilities = htole16(0x11ce);
+-	tlv->ampdu_params = 0x1b;
+-	tlv->rx_mcs = 0xff; /* one stream, all MCS */
+-
+-	tlv->unknown = htole16(0);
+-	tlv->unknown2 = htole16(0);
++	if (state->election.custom_metric) {
++		tlv->ht_capabilities = htole16(0x11ee); /* 0x11ce with Bit 5 set: Short GI for 20 MHz */
++		tlv->ampdu_params = 0x1b;
++		tlv->rx_mcs = 0xff; /* stream 1: all MCS (0..7) */
++		tlv->unknown = htole16(0);
++		tlv->unknown2 = htole16(0x00ff); /* stream 2: all MCS (8..15) */
++	} else {
++		tlv->ht_capabilities = htole16(0x11ce);
++		tlv->ampdu_params = 0x1b;
++		tlv->rx_mcs = 0xff; /* one stream, all MCS */
++		tlv->unknown = htole16(0);
++		tlv->unknown2 = htole16(0);
++	}
+ 
+ 	return sizeof(struct awdl_ht_capabilities_tlv);
+ }
+ 
+ int awdl_init_data_path_state_tlv(uint8_t *buf, const struct awdl_state *state) {
+ 	struct awdl_data_path_state_tlv *tlv = (struct awdl_data_path_state_tlv *) buf;
++	uint8_t master_chan = awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS);
++	uint16_t flags;
++	uint16_t ext_flags = 0;
+ 
+ 	tlv->type = AWDL_DATA_PATH_STATE_TLV;
+ 	tlv->length = htole16(sizeof(struct awdl_data_path_state_tlv) - sizeof(struct tl));
+ 
+-	/* TODO this is very ugly currently */
+-	tlv->flags = htole16(0x8f24);
+-
+ 	tlv->awdl_addr = state->self_address;
+ 
+ 	tlv->country_code[0] = 'X';
+ 	tlv->country_code[1] = '0';
+ 	tlv->country_code[2] = 0;
+ 
+-	if (awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS) == 6)
+-		tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_6_BIT);
+-	else if (awdl_chan_num(state->channel.master, AWDL_CHAN_ENC_OPCLASS) == 44) {
+-		tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_44_BIT);
+-	} else { // 149
+-		tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_149_BIT);
++	if (state->election.custom_metric) {
++		/* Base flags for sync master: Extension flags present, UMI supported,
++		 * AirPlay solo, Follow Channel Sequence, Social channels present,
++		 * Country code present, AWDL address present, Real-Time mode */
++		flags = AWDL_DATA_PATH_FLAG_EXT_FLAGS |
++		        AWDL_DATA_PATH_FLAG_UMI_SUPPORTED |
++		        AWDL_DATA_PATH_FLAG_AIRPLAY_SOLO |
++		        AWDL_DATA_PATH_FLAG_FOLLOW_CHAN_SEQ |
++		        AWDL_DATA_PATH_FLAG_SOCIAL_CHANNEL_MAP |
++		        AWDL_DATA_PATH_FLAG_COUNTRY_CODE |
++		        AWDL_DATA_PATH_FLAG_AWDL_ADDRESS |
++		        AWDL_DATA_PATH_FLAG_REALTIME;
++
++		if (master_chan == 6) {
++			/* Channel 6 exclusive mode: clear Dualband to compel peer
++			 * to allocate primary data slots to Channel 6 */
++			tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_6_BIT);
++			ext_flags |= AWDL_DATA_PATH_EXT_SOCIAL_MAP_SUPPORTED;
++		} else if (master_chan == 44) {
++			flags |= AWDL_DATA_PATH_FLAG_DUALBAND;
++			tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_44_BIT);
++		} else { // 149
++			flags |= AWDL_DATA_PATH_FLAG_DUALBAND;
++			tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_149_BIT);
++		}
++		log_debug("tx data path: flags=0x%04x ext=0x%04x social=0x%04x master_chan=%d",
++		          flags, ext_flags, le16toh(tlv->social_channels), master_chan);
++	} else {
++		/* Upstream stock default */
++		flags = 0x8f24;
++		if (master_chan == 6)
++			tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_6_BIT);
++		else if (master_chan == 44)
++			tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_44_BIT);
++		else // 149
++			tlv->social_channels = htole16(AWDL_SOCIAL_CHANNEL_149_BIT);
+ 	}
+ 
+-	tlv->ext_flags = htole16(0x0000);
++	tlv->flags = htole16(flags);
++	tlv->ext_flags = htole16(ext_flags);
+ 
+ 	return sizeof(struct awdl_data_path_state_tlv);
+ }
